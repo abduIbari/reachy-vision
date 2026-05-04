@@ -32,7 +32,6 @@ model_name = "moondream:1.8b"
 
 # cap.release()
 
-
 import os
 import ollama
 from langchain_groq import ChatGroq
@@ -41,27 +40,36 @@ from langchain_core.tools import tool
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
 
-# Set your Groq API Key
-os.environ["GROQ_API_KEY"] = "your_groq_api_key_here"
 
+from typing import Optional
+import cv2
+import os
 
-# --- STEP 1: Define the Vision Tool ---
 @tool
-def analyze_robot_vision(query: str) -> str:
+def analyze_robot_vision(query: str, image_path: Optional[str] = None) -> str:
     """
-    Use this tool ONLY when the user asks questions about the physical environment,
-    objects they are holding, or what the robot can see right now.
+    Use this tool to see the world. 
+    If 'image_path' is provided, the robot looks at that specific file.
+    Otherwise, it uses its live camera feed.
     """
     print(f"\n[System] Brain requested Vision. Query: '{query}'")
+    
+    frame = None
+    
+    # Check if we should use a specific file or the live camera
+    if image_path and os.path.exists(image_path):
+        print(f"[System] Loading image from path: {image_path}")
+        frame = cv2.imread(image_path)
+    else:
+        print("[System] Using live camera feed.")
+        cap = cv2.VideoCapture(0)
+        ret, captured_frame = cap.read()
+        if ret:
+            frame = captured_frame
+        cap.release()
 
-    # Path to the frame captured from Reachy's camera
-    # For testing, you can use a static image path
-
-    cap = cv2.VideoCapture(0)
-    ret, frame = cap.read()
-
-    if ret:
-        # Encode frame to JPEG format in memory
+    if frame is not None:
+        # Encode to JPEG for Ollama
         _, buffer = cv2.imencode(".jpg", frame)
         image_bytes = buffer.tobytes()
 
@@ -70,28 +78,25 @@ def analyze_robot_vision(query: str) -> str:
             messages=[
                 {
                     "role": "user",
-                    "content": "what do you see?",
-                    "images": [image_bytes],  # Ollama accepts raw bytes
+                    "content": query if query else "What do you see?",
+                    "images": [image_bytes],
                 }
             ],
         )
-        result = response["message"]["content"]
-        print(result)
-        return result
+        return response["message"]["content"]
+    
+    return "I tried to see, but I couldn't access the image source."
 
-    cap.release()
-
-
-# --- STEP 2: Initialize the Groq Brain ---
-# llm = ChatGroq(
-#     model="openai/gpt-oss-120b",
-#     temperature=0,
-# )
-
-llm = ChatOllama(
-    model="qwen3.5:4b",
+# # --- STEP 2: Initialize the Groq Brain ---
+llm = ChatGroq(
+    model="openai/gpt-oss-120b",
     temperature=0,
 )
+
+# llm = ChatOllama(
+#     model="qwen3.5:4b",
+#     temperature=0,
+# )
 
 tools = [analyze_robot_vision]
 
@@ -100,7 +105,8 @@ prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are the AI brain of Reachy, a humanoid robot. Use your tools to see the world.",
+            "You are the AI brain of Reachy, a humanoid robot who would work in an AI/Robotics lab. Use your tools to see the world."
+            "Report only high-confidence visual facts. Do not speculate on the purpose or condition of objects unless explicitly visible",
         ),
         ("placeholder", "{chat_history}"),
         ("human", "{input}"),
@@ -108,10 +114,54 @@ prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
+
+import subprocess
+
+def get_vram():
+    result = subprocess.check_output(
+        "nvidia-smi --query-gpu=memory.used --format=csv,nounits,noheader",
+        shell=True
+    )
+    return int(result.decode().strip().split("\n")[0])
+
+
+
+
 agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-# --- STEP 4: Run a Test ---
-print("Robot Initialized.")
-query = "I am holding an object in front of your camera. Can you tell me what it is and what color it is?"
-agent_executor.invoke({"input": query})
+from langchain_core.messages import HumanMessage, AIMessage
+
+print("\n--- Reachy is Online ---")
+print("Type 'exit' or 'quit' to stop the session.\n")
+
+chat_history = []
+
+while True:
+    user_input = input("You: ")
+    
+    if user_input.lower() in ["exit", "quit"]:
+        print("Shutting down Reachy's brain...")
+        break
+
+    before_turn = get_vram()
+
+    try:
+        response = agent_executor.invoke({
+            "input": user_input,
+            "chat_history": chat_history
+        })
+        
+        output = response["output"]
+        print(f"\nReachy: {output}\n")
+
+        # 4. Update Memory
+        chat_history.append(HumanMessage(content=user_input))
+        chat_history.append(AIMessage(content=output))
+
+    except Exception as e:
+        print(f"\n[Error] Brain hiccup: {e}\n")
+
+    # 5. Report VRAM usage for the turn
+    after_turn = get_vram()
+    print(f"Turn VRAM change: {after_turn - before_turn} MB") # Uncomment if you want turn-by-turn tracking
